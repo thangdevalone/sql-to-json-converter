@@ -303,6 +303,4 @@ MIT License
 ## 📞 Support
 
 - 🐛 **Bug reports**: [GitHub Issues](https://github.com/thangdevalone/sql-to-json-converter/issues)
-- 💡 **Feature requests**: [GitHub Discussions](https://github.com/thangdevalone/sql-to-json-converter/discussions)
-- 📚 **Documentation**: [GitHub Wiki](https://github.com/thangdevalone/sql-to-json-converter/wiki)
-- 📧 **Email**: support@sql-to-json.com 
+- 📧 **Email**: thangdevalone@gmail.com

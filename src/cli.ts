@@ -1,41 +1,70 @@
 #!/usr/bin/env node
 
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline');
+import * as fs from 'fs';
+import * as path from 'path';
+import * as readline from 'readline';
+import {
+  ConverterOptions,
+  ColumnDefinition,
+  TableInfo,
+  TablesCollection,
+  InsertInfo,
+  ConversionResult,
+  SeparateFilesResult,
+  TableData,
+  SummaryData,
+  CLIArgs
+} from './types';
 
-class SQLToJSONConverter {
-  constructor(options = {}) {
+/**
+ * SQL to JSON Converter class with full TypeScript support
+ */
+export class SQLToJSONConverter {
+  private readonly batchSize: number;
+  private readonly showMemory: boolean;
+  private readonly limit: number | null;
+  private readonly skipUnparsable: boolean;
+  private readonly outputMode: 'combined' | 'separate';
+  private readonly outputDir: string;
+  private processedStatements: number = 0;
+  private readonly tables: TablesCollection = {};
+  private currentTable: string | null = null;
+  private insideTransaction: boolean = false;
+
+  constructor(options: ConverterOptions = {}) {
     this.batchSize = options.batchSize || 500;
     this.showMemory = options.showMemory || false;
     this.limit = options.limit || null;
     this.skipUnparsable = options.skipUnparsable || false;
-    this.outputMode = options.outputMode || 'combined'; // 'combined' or 'separate'
+    this.outputMode = options.outputMode || 'combined';
     this.outputDir = options.outputDir || 'json-output';
-    this.processedStatements = 0;
-    this.tables = {};
-    this.currentTable = null;
-    this.currentCreateTable = '';
-    this.insideTransaction = false;
   }
 
-  logMemoryUsage() {
+  /**
+   * Log current memory usage if enabled
+   */
+  private logMemoryUsage(): void {
     if (this.showMemory) {
       const used = process.memoryUsage();
-      console.error(`Memory: RSS ${Math.round(used.rss / 1024 / 1024 * 100) / 100} MB, Heap ${Math.round(used.heapUsed / 1024 / 1024 * 100) / 100} MB`);
+      const rss = Math.round(used.rss / 1024 / 1024 * 100) / 100;
+      const heap = Math.round(used.heapUsed / 1024 / 1024 * 100) / 100;
+      console.log(`Memory: RSS ${rss} MB, Heap ${heap} MB`);
     }
   }
 
-  parseCreateTable(sql) {
+  /**
+   * Parse CREATE TABLE statement
+   */
+  private parseCreateTable(sql: string): TableInfo | null {
     try {
-      // Extract table name
+      // Extract table name - support both with and without backticks
       const tableMatch = sql.match(/CREATE TABLE\s+`?([^`\s(]+)`?\s*\(/i);
       if (!tableMatch) return null;
 
       const tableName = tableMatch[1].replace(/^SERVMASK_PREFIX_/, '');
       
       // Extract columns from CREATE TABLE statement
-      const columns = [];
+      const columns: ColumnDefinition[] = [];
       
       // Find the content between the first ( and the last )
       const startParen = sql.indexOf('(');
@@ -45,13 +74,38 @@ class SQLToJSONConverter {
       
       const columnsPart = sql.substring(startParen + 1, endParen);
       
-      // Split by lines and process each line
-      const lines = columnsPart.split('\n');
+      // Split by comma but handle commas within parentheses (e.g., DECIMAL(10,2))
+      const columnDefs: string[] = [];
+      let current = '';
+      let parenDepth = 0;
       
-      for (const line of lines) {
-        const trimmed = line.trim();
+      for (let i = 0; i < columnsPart.length; i++) {
+        const char = columnsPart[i];
         
-        // Skip empty lines, comments, PRIMARY KEY, KEY definitions, and ENGINE
+        if (char === '(') {
+          parenDepth++;
+          current += char;
+        } else if (char === ')') {
+          parenDepth--;
+          current += char;
+        } else if (char === ',' && parenDepth === 0) {
+          // This is a column separator comma, not a comma within a type
+          columnDefs.push(current.trim());
+          current = '';
+        } else {
+          current += char;
+        }
+      }
+      
+      // Add the last column definition
+      if (current.trim()) {
+        columnDefs.push(current.trim());
+      }
+      
+      for (const colDef of columnDefs) {
+        const trimmed = colDef.trim();
+        
+        // Skip empty definitions, comments, PRIMARY KEY, KEY definitions, and ENGINE
         if (!trimmed || 
             trimmed.startsWith('--') || 
             trimmed.toUpperCase().startsWith('PRIMARY KEY') || 
@@ -62,14 +116,12 @@ class SQLToJSONConverter {
           continue;
         }
         
-        // Look for column definitions that start with backtick
-        const columnMatch = trimmed.match(/^`([^`]+)`\s+(.+?)(?:,\s*)?$/);
+        // Look for column definitions - support both with and without backticks
+        // Match: `column_name` TYPE or column_name TYPE
+        const columnMatch = trimmed.match(/^`?([^`\s]+)`?\s+(.+)$/);
         if (columnMatch) {
           const columnName = columnMatch[1];
-          let columnType = columnMatch[2].trim();
-          
-          // Remove trailing comma
-          columnType = columnType.replace(/,$/, '');
+          const columnType = columnMatch[2].trim();
           
           columns.push({
             name: columnName,
@@ -85,15 +137,18 @@ class SQLToJSONConverter {
       };
     } catch (error) {
       if (!this.skipUnparsable) {
-        console.error(`Error parsing CREATE TABLE: ${error.message}`);
+        console.error(`Error parsing CREATE TABLE: ${(error as Error).message}`);
       }
       return null;
     }
   }
 
-  parseInsertInto(sql) {
+  /**
+   * Parse INSERT INTO statement
+   */
+  private parseInsertInto(sql: string): InsertInfo | null {
     try {
-      // Extract table name
+      // Extract table name - support both with and without backticks
       const tableMatch = sql.match(/INSERT INTO\s+`?([^`\s(]+)`?\s*(?:\([^)]+\))?\s*VALUES/i);
       if (!tableMatch) return null;
 
@@ -104,7 +159,7 @@ class SQLToJSONConverter {
       if (!valuesMatch) return null;
 
       const valuesString = valuesMatch[1];
-      const records = [];
+      const records: any[][] = [];
       
       // Split by ),( to handle multiple records
       const valueGroups = valuesString.split(/\),\s*\(/);
@@ -128,14 +183,17 @@ class SQLToJSONConverter {
       };
     } catch (error) {
       if (!this.skipUnparsable) {
-        console.error(`Error parsing INSERT INTO: ${error.message}`);
+        console.error(`Error parsing INSERT INTO: ${(error as Error).message}`);
       }
       return null;
     }
   }
 
-  parseValues(valueString) {
-    const values = [];
+  /**
+   * Parse individual values from VALUES clause
+   */
+  private parseValues(valueString: string): any[] {
+    const values: any[] = [];
     let current = '';
     let inString = false;
     let stringChar = '';
@@ -143,7 +201,6 @@ class SQLToJSONConverter {
     
     for (let i = 0; i < valueString.length; i++) {
       const char = valueString[i];
-      const nextChar = valueString[i + 1];
       
       if (!inString) {
         if (char === "'" || char === '"') {
@@ -177,7 +234,10 @@ class SQLToJSONConverter {
     return values;
   }
 
-  cleanValue(value) {
+  /**
+   * Clean and convert SQL values to proper JavaScript types
+   */
+  private cleanValue(value: string): any {
     value = value.trim();
     
     // Handle NULL
@@ -193,7 +253,7 @@ class SQLToJSONConverter {
     
     // Handle numbers
     if (/^-?\d+$/.test(value)) {
-      return parseInt(value);
+      return parseInt(value, 10);
     }
     
     if (/^-?\d+\.\d+$/.test(value)) {
@@ -203,9 +263,12 @@ class SQLToJSONConverter {
     return value;
   }
 
-  processStatement(sql) {
+  /**
+   * Process a single SQL statement
+   */
+  private processStatement(sql: string): boolean {
     sql = sql.trim();
-    if (!sql) return;
+    if (!sql) return true;
 
     this.processedStatements++;
     
@@ -243,7 +306,7 @@ class SQLToJSONConverter {
         
         // Convert records to objects using column names
         for (const record of insertInfo.records) {
-          const obj = {};
+          const obj: Record<string, any> = {};
           table.columns.forEach((col, index) => {
             if (index < record.length) {
               obj[col.name] = record[index];
@@ -258,19 +321,22 @@ class SQLToJSONConverter {
     return true;
   }
 
-  async processLargeSQL(inputFile, outputFile) {
-    console.error('🚀 Starting SQL to JSON conversion...');
-    console.error(`📁 Input: ${inputFile}`);
+  /**
+   * Process large SQL files with streaming
+   */
+  public async processLargeSQL(inputFile: string, outputFile?: string): Promise<void> {
+    console.log('🚀 Starting SQL to JSON conversion...');
+    console.log(`📁 Input: ${inputFile}`);
     
     if (this.outputMode === 'separate') {
-      console.error(`📁 Output directory: ${this.outputDir}/`);
+      console.log(`📁 Output directory: ${this.outputDir}/`);
       this.ensureOutputDirectory();
     } else {
-      console.error(`📄 Output: ${outputFile || 'stdout'}`);
+      console.log(`📄 Output: ${outputFile || 'stdout'}`);
     }
     
-    console.error(`⚙️  Batch size: ${this.batchSize}`);
-    if (this.limit) console.error(`🔢 Limit: ${this.limit} statements`);
+    console.log(`⚙️  Batch size: ${this.batchSize}`);
+    if (this.limit) console.log(`🔢 Limit: ${this.limit} statements`);
     
     const fileStream = fs.createReadStream(inputFile);
     const rl = readline.createInterface({
@@ -286,7 +352,7 @@ class SQLToJSONConverter {
       lineCount++;
       
       if (lineCount % 1000 === 0) {
-        console.error(`📊 Processed ${lineCount} lines, ${this.processedStatements} statements, ${Object.keys(this.tables).length} tables`);
+        console.log(`📊 Processed ${lineCount} lines, ${this.processedStatements} statements, ${Object.keys(this.tables).length} tables`);
         this.logMemoryUsage();
       }
 
@@ -304,7 +370,7 @@ class SQLToJSONConverter {
         currentStatement = '';
         
         if (!shouldContinue) {
-          console.error('🛑 Reached processing limit');
+          console.log('🛑 Reached processing limit');
           break;
         }
       }
@@ -318,14 +384,14 @@ class SQLToJSONConverter {
     const endTime = Date.now();
     const duration = (endTime - startTime) / 1000;
 
-    console.error(`✅ Conversion completed in ${duration.toFixed(2)}s`);
-    console.error(`📊 Final stats:`);
-    console.error(`   - Lines processed: ${lineCount}`);
-    console.error(`   - Statements processed: ${this.processedStatements}`);
-    console.error(`   - Tables found: ${Object.keys(this.tables).length}`);
+    console.log(`✅ Conversion completed in ${duration.toFixed(2)}s`);
+    console.log(`📊 Final stats:`);
+    console.log(`   - Lines processed: ${lineCount}`);
+    console.log(`   - Statements processed: ${this.processedStatements}`);
+    console.log(`   - Tables found: ${Object.keys(this.tables).length}`);
     
     Object.keys(this.tables).forEach(tableName => {
-      console.error(`   - ${tableName}: ${this.tables[tableName].data.length} records`);
+      console.log(`   - ${tableName}: ${this.tables[tableName].data.length} records`);
     });
 
     this.logMemoryUsage();
@@ -338,14 +404,20 @@ class SQLToJSONConverter {
     }
   }
 
-  ensureOutputDirectory() {
+  /**
+   * Ensure output directory exists
+   */
+  private ensureOutputDirectory(): void {
     if (!fs.existsSync(this.outputDir)) {
       fs.mkdirSync(this.outputDir, { recursive: true });
-      console.error(`📁 Created output directory: ${this.outputDir}`);
+      console.log(`📁 Created output directory: ${this.outputDir}`);
     }
   }
 
-  writeSeparateJSONFiles() {
+  /**
+   * Write separate JSON files for each table
+   */
+  private writeSeparateJSONFiles(): void {
     this.ensureOutputDirectory();
     
     let filesWritten = 0;
@@ -353,7 +425,7 @@ class SQLToJSONConverter {
       const fileName = `${tableName}.json`;
       const filePath = path.join(this.outputDir, fileName);
       
-      const tableData = {
+      const tableData: TableData = {
         tableName,
         columns: table.columns,
         recordCount: table.data.length,
@@ -362,12 +434,12 @@ class SQLToJSONConverter {
       };
       
       fs.writeFileSync(filePath, JSON.stringify(tableData, null, 2), 'utf-8');
-      console.error(`✅ Wrote ${filePath} (${table.data.length} records)`);
+      console.log(`✅ Wrote ${filePath} (${table.data.length} records)`);
       filesWritten++;
     }
     
     // Create summary file
-    const summary = {
+    const summary: SummaryData = {
       generatedAt: new Date().toISOString(),
       totalTables: Object.keys(this.tables).length,
       totalRecords: Object.values(this.tables).reduce((sum, table) => sum + table.data.length, 0),
@@ -380,13 +452,16 @@ class SQLToJSONConverter {
     
     const summaryPath = path.join(this.outputDir, '_summary.json');
     fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
-    console.error(`✅ Wrote summary file: ${summaryPath}`);
+    console.log(`✅ Wrote summary file: ${summaryPath}`);
     
-    console.error(`🎉 Successfully wrote ${filesWritten} table files + 1 summary file`);
+    console.log(`🎉 Successfully wrote ${filesWritten} table files + 1 summary file`);
   }
 
-  writeCombinedJSON(outputFile) {
-    const result = {
+  /**
+   * Write combined JSON file
+   */
+  private writeCombinedJSON(outputFile?: string): void {
+    const result: ConversionResult = {
       metadata: {
         generatedAt: new Date().toISOString(),
         totalTables: Object.keys(this.tables).length,
@@ -399,18 +474,29 @@ class SQLToJSONConverter {
 
     if (outputFile) {
       fs.writeFileSync(outputFile, json);
-      console.error(`💾 Output written to ${outputFile}`);
+      console.log(`💾 Output written to ${outputFile}`);
     } else {
       console.log(json);
     }
   }
 
-  sqlToJson(content) {
-    const statements = content.split(';').filter(s => s.trim());
+  /**
+   * Convert SQL content to JSON (in-memory processing)
+   */
+  public sqlToJson(content: string): ConversionResult {
+    // Remove BOM if present
+    content = content.replace(/^\uFEFF/, '');
+    
+    const statements = content
+      .split(';')
+      .map(s => s.trim())
+      .filter(s => s && !s.startsWith('--'));
     
     for (const statement of statements) {
-      const shouldContinue = this.processStatement(statement);
-      if (!shouldContinue) break;
+      if (statement.length > 0) {
+        const shouldContinue = this.processStatement(statement);
+        if (!shouldContinue) break;
+      }
     }
 
     return {
@@ -423,16 +509,24 @@ class SQLToJSONConverter {
     };
   }
 
-  // New method for separate files output from string content
-  sqlToJsonFiles(content, outputDir = 'json-output') {
-    this.outputDir = outputDir;
-    this.outputMode = 'separate';
+  /**
+   * Convert SQL content to separate JSON files
+   */
+  public sqlToJsonFiles(content: string, outputDir = 'json-output'): SeparateFilesResult {
+    // Remove BOM if present
+    content = content.replace(/^\uFEFF/, '');
     
-    const statements = content.split(';').filter(s => s.trim());
+    // Split by semicolon and newline patterns, then clean up
+    const statements = content
+      .split(';')
+      .map(s => s.trim())
+      .filter(s => s && !s.startsWith('--')); // Remove empty and comment-only statements
     
     for (const statement of statements) {
-      const shouldContinue = this.processStatement(statement);
-      if (!shouldContinue) break;
+      if (statement.length > 0) {
+        const shouldContinue = this.processStatement(statement);
+        if (!shouldContinue) break;
+      }
     }
 
     this.writeSeparateJSONFiles();
@@ -449,28 +543,31 @@ class SQLToJSONConverter {
   }
 }
 
-function showHelp() {
+/**
+ * Show CLI help information
+ */
+function showHelp(): void {
   console.log(`
 🔄 SQL to JSON Converter
-Chuyển đổi file SQL sang JSON một cách hiệu quả
+Powerful SQL to JSON converter with efficient processing
 
-Cách sử dụng:
+Usage:
   npx sql-to-json-converter [input.sql] [options]
   sql-to-json [input.sql] [options]
 
-Tùy chọn:
-  --help, -h                Hiển thị hướng dẫn này
-  --version, -v             Hiển thị phiên bản
-  --output [file]           File đầu ra (cho chế độ combined)
-  --separate                Xuất từng bảng thành file riêng (mặc định)
-  --combined                Xuất tất cả vào 1 file JSON
-  --output-dir [dir]        Thư mục đầu ra (mặc định: json-output)
-  --memory, -m              Hiển thị thông tin bộ nhớ
-  --batch-size [số]         Batch size (mặc định: 500)
-  --limit [số]              Giới hạn số lượng SQL statements
-  --skip-unparsable         Bỏ qua statements không parse được
+Options:
+  --help, -h                Show help
+  --version, -v             Show version
+  --output [file]           Output file for combined mode
+  --separate                Export separate files (default)
+  --combined                Export combined file
+  --output-dir [dir]        Output directory (default: json-output)
+  --memory, -m              Show memory usage
+  --batch-size [num]        Batch size (default: 500)
+  --limit [num]             Limit number of statements
+  --skip-unparsable         Skip unparsable statements
 
-Ví dụ:
+Examples:
   npx sql-to-json-converter database.sql
   npx sql-to-json-converter database.sql --output-dir my-json-files
   npx sql-to-json-converter database.sql --combined --output result.json
@@ -478,12 +575,61 @@ Ví dụ:
   `);
 }
 
-function showVersion() {
+/**
+ * Show version information
+ */
+function showVersion(): void {
   const pkg = require('../package.json');
   console.log(pkg.version);
 }
 
-async function main() {
+/**
+ * Parse CLI arguments
+ */
+function parseArgs(args: string[]): CLIArgs {
+  const result: CLIArgs = {
+    inputFile: args[0] || '',
+    outputDir: 'json-output',
+    showMemory: false,
+    skipUnparsable: false,
+    isCombined: false,
+    batchSize: 500,
+    limit: null
+  };
+
+  // Parse flags
+  result.showMemory = args.includes('--memory') || args.includes('-m');
+  result.skipUnparsable = args.includes('--skip-unparsable');
+  result.isCombined = args.includes('--combined');
+
+  // Parse options with values
+  if (args.includes('--output')) {
+    const outputIndex = args.indexOf('--output');
+    result.outputFile = args[outputIndex + 1];
+  }
+
+  if (args.includes('--output-dir')) {
+    const dirIndex = args.indexOf('--output-dir');
+    result.outputDir = args[dirIndex + 1] || 'json-output';
+  }
+
+  if (args.includes('--batch-size')) {
+    const batchIndex = args.indexOf('--batch-size');
+    result.batchSize = parseInt(args[batchIndex + 1]) || 500;
+  }
+
+  if (args.includes('--limit')) {
+    const limitIndex = args.indexOf('--limit');
+    result.limit = parseInt(args[limitIndex + 1]) || null;
+  }
+
+  return result;
+}
+
+/**
+ * Main CLI function
+ */
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
   if (args.includes('--help') || args.includes('-h')) {
@@ -495,108 +641,77 @@ async function main() {
   }
 
   if (args.length === 0) {
-    console.error('❌ Lỗi: Vui lòng cung cấp đường dẫn file SQL');
+    console.error('❌ Error: Please provide SQL file path');
     showHelp();
     process.exit(1);
   }
 
-  const inputFile = args[0];
+  const parsedArgs = parseArgs(args);
 
-  // Parse options
-  const showMemory = args.includes('--memory') || args.includes('-m');
-  const skipUnparsable = args.includes('--skip-unparsable');
-  const isCombined = args.includes('--combined');
-  const isSeparate = args.includes('--separate') || !isCombined; // default to separate
-  
-  let outputFile = null;
-  if (args.includes('--output')) {
-    const outputIndex = args.indexOf('--output');
-    outputFile = args[outputIndex + 1];
-  }
-  
-  let outputDir = 'json-output';
-  if (args.includes('--output-dir')) {
-    const dirIndex = args.indexOf('--output-dir');
-    outputDir = args[dirIndex + 1] || 'json-output';
-  }
-  
-  let batchSize = 500;
-  if (args.includes('--batch-size')) {
-    const batchIndex = args.indexOf('--batch-size');
-    batchSize = parseInt(args[batchIndex + 1]) || 500;
-  }
-  
-  let limit = null;
-  if (args.includes('--limit')) {
-    const limitIndex = args.indexOf('--limit');
-    limit = parseInt(args[limitIndex + 1]) || null;
-  }
-
-  if (!fs.existsSync(inputFile)) {
-    console.error(`❌ Không tìm thấy file: ${inputFile}`);
+  if (!fs.existsSync(parsedArgs.inputFile)) {
+    console.error(`❌ File not found: ${parsedArgs.inputFile}`);
     process.exit(1);
   }
 
-  const stats = fs.statSync(inputFile);
+  const stats = fs.statSync(parsedArgs.inputFile);
   const sizeMB = stats.size / (1024 * 1024);
 
-  console.error(`📊 File size: ${sizeMB.toFixed(2)} MB`);
+  console.log(`📊 File size: ${sizeMB.toFixed(2)} MB`);
 
   try {
     const converter = new SQLToJSONConverter({
-      batchSize,
-      showMemory,
-      limit,
-      skipUnparsable,
-      outputMode: isCombined ? 'combined' : 'separate',
-      outputDir
+      batchSize: parsedArgs.batchSize,
+      showMemory: parsedArgs.showMemory,
+      limit: parsedArgs.limit,
+      skipUnparsable: parsedArgs.skipUnparsable,
+      outputMode: parsedArgs.isCombined ? 'combined' : 'separate',
+      outputDir: parsedArgs.outputDir
     });
 
-    if (sizeMB > 10 || showMemory || limit) {
-      console.error('📦 File lớn được phát hiện. Sử dụng stream processing...');
-      await converter.processLargeSQL(inputFile, outputFile);
+    if (sizeMB > 10 || parsedArgs.showMemory || parsedArgs.limit) {
+      console.log('📦 Large file detected. Using stream processing...');
+      await converter.processLargeSQL(parsedArgs.inputFile, parsedArgs.outputFile);
     } else {
-      console.error('📦 File nhỏ được phát hiện. Sử dụng in-memory parsing...');
-      const content = fs.readFileSync(inputFile, 'utf8');
+      console.log('📦 Small file detected. Using in-memory parsing...');
+      const content = fs.readFileSync(parsedArgs.inputFile, 'utf8');
       
-      if (isCombined) {
+      if (parsedArgs.isCombined) {
         const result = converter.sqlToJson(content);
         const json = JSON.stringify(result, null, 2);
 
-        if (outputFile) {
-          fs.writeFileSync(outputFile, json);
-          console.error(`✅ Đã ghi kết quả vào ${outputFile}`);
+        if (parsedArgs.outputFile) {
+          fs.writeFileSync(parsedArgs.outputFile, json);
+          console.log(`✅ Result written to ${parsedArgs.outputFile}`);
         } else {
           console.log(json);
         }
       } else {
-        converter.sqlToJsonFiles(content, outputDir);
+        converter.sqlToJsonFiles(content, parsedArgs.outputDir);
       }
     }
   } catch (err) {
-    console.error(`❌ Lỗi: ${err.message}`);
-    console.error(err.stack);
+    console.error(`❌ Error: ${(err as Error).message}`);
+    console.error((err as Error).stack);
     process.exit(1);
   }
 }
 
 // Export functions for use as library
-module.exports = {
-  SQLToJSONConverter,
-  sqlToJson: (content, options = {}) => {
-    const converter = new SQLToJSONConverter(options);
-    return converter.sqlToJson(content);
-  },
-  sqlToJsonFiles: (content, outputDir = 'json-output', options = {}) => {
-    const converter = new SQLToJSONConverter({ ...options, outputDir, outputMode: 'separate' });
-    return converter.sqlToJsonFiles(content, outputDir);
-  },
-  processLargeSQL: async (inputFile, outputFile, options = {}) => {
-    const converter = new SQLToJSONConverter(options);
-    return converter.processLargeSQL(inputFile, outputFile);
-  }
+export const sqlToJson = (content: string, options: ConverterOptions = {}): ConversionResult => {
+  const converter = new SQLToJSONConverter(options);
+  return converter.sqlToJson(content);
+};
+
+export const sqlToJsonFiles = (content: string, outputDir = 'json-output', options: ConverterOptions = {}): SeparateFilesResult => {
+  const converter = new SQLToJSONConverter({ ...options, outputDir, outputMode: 'separate' });
+  return converter.sqlToJsonFiles(content, outputDir);
+};
+
+export const processLargeSQL = async (inputFile: string, outputFile?: string, options: ConverterOptions = {}): Promise<void> => {
+  const converter = new SQLToJSONConverter(options);
+  return converter.processLargeSQL(inputFile, outputFile);
 };
 
 if (require.main === module) {
-  main();
-}
+  main().catch(console.error);
+} 

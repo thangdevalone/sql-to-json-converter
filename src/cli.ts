@@ -235,6 +235,41 @@ export class SQLToJSONConverter {
   }
 
   /**
+   * Split SQL content into statements, handling semicolons in strings
+   */
+  private splitStatements(sql: string): string[] {
+    const statements: string[] = [];
+    let currentStatement = '';
+    let inString = false;
+    let stringChar = '';
+
+    for (let i = 0; i < sql.length; i++) {
+      const char = sql[i];
+      currentStatement += char;
+
+      if (char === "'" || char === '"') {
+        if (!inString) {
+          inString = true;
+          stringChar = char;
+        } else if (char === stringChar && sql[i - 1] !== '\\') {
+          inString = false;
+        }
+      }
+
+      if (char === ';' && !inString) {
+        statements.push(currentStatement.trim());
+        currentStatement = '';
+      }
+    }
+
+    if (currentStatement.trim()) {
+      statements.push(currentStatement.trim());
+    }
+
+    return statements;
+  }
+
+  /**
    * Clean and convert SQL values to proper JavaScript types
    */
   private cleanValue(value: string): any {
@@ -487,8 +522,7 @@ export class SQLToJSONConverter {
     // Remove BOM if present
     content = content.replace(/^\uFEFF/, '');
     
-    const statements = content
-      .split(';')
+    const statements = this.splitStatements(content)
       .map(s => s.trim())
       .filter(s => s && !s.startsWith('--'));
     
@@ -517,8 +551,7 @@ export class SQLToJSONConverter {
     content = content.replace(/^\uFEFF/, '');
     
     // Split by semicolon and newline patterns, then clean up
-    const statements = content
-      .split(';')
+    const statements = this.splitStatements(content)
       .map(s => s.trim())
       .filter(s => s && !s.startsWith('--')); // Remove empty and comment-only statements
     
